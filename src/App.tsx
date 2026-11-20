@@ -1,272 +1,280 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { audioSession } from './audio/session'
-import { clearSpectrogramCache } from './audio/stft'
-import { Composer } from './components/Composer'
+import { decodeMono, encodePcm, MAX_SECONDS, playbackWav, SAMPLE_RATE } from './audio/pcm'
+import { AudioEntry } from './components/AudioEntry'
+import { Composer, type MicState } from './components/Composer'
 import { Header } from './components/Header'
 import { Metrics } from './components/Metrics'
 import { Player } from './components/Player'
 import { Spectrogram } from './components/Spectrogram'
 import { Thread, type Turn } from './components/Thread'
-import {
-  DESCRIPTION,
-  METRICS,
-  OFFTOPIC,
-  SAMPLE_AUDIO_SRC,
-  SAMPLE_DURATION,
-  SAMPLE_SUBTITLE,
-  matchAnswer,
-  utteranceAt,
-} from './data/sample'
+import { SAMPLE_AUDIO_SRC, SAMPLE_TITLE, SAMPLE_CREDIT_URL } from './data/sample'
 import { usePrefersReducedMotion } from './hooks/usePrefersReducedMotion'
+import { useRecordingMeasurement } from './hooks/useRecordingMeasurement'
+import { askRecording, MeasurementExpiredError } from './lib/measurement'
 
 const MAX_BYTES = 30 * 1024 * 1024
-const MAX_SECONDS = 180
-const ACCEPT_EXT = new Set(['mp3', 'wav', 'm4a', 'webm', 'ogg', 'oga'])
-
-type SourceKind = 'sample' | 'user'
-
-type UserClip = {
-  url: string
-  name: string
-  duration: number
-  kind: 'upload' | 'record'
+type ClipSource = 'recording' | 'upload' | 'sample'
+type UserClip = { url: string; name: string; duration: number; samples: Float32Array; pcm: Blob; source: ClipSource }
+const changeQuestion = '哪一刻语气或节奏变了？带我回听那几秒。'
+const questions = {
+  conversation: ['有几个人在说话？听起来像在争论，还是在商量？', '谁在推动话题？哪句话让你这么判断？', changeQuestion],
+  single: ['这个人最想让听众记住什么？哪句话最能说明？', '说到哪里停得最久？停下来之后说了什么？', changeQuestion],
+  sounds: ['最先听到的声音和结尾一样吗？', '哪种声音反复出现？帮我找到相邻的两次。', '只回听几秒，哪一段最能听出声音的变化？'],
 }
 
-export default function App() {
+async function sampleFile(): Promise<Blob> {
+  const response = await fetch(SAMPLE_AUDIO_SRC)
+  if (!response.ok) throw new Error('无法读取示例音频。')
+  return response.blob()
+}
+
+type Capture = { stream?: MediaStream; recorder?: MediaRecorder; timer?: number }
+
+function releaseMic(job: Capture) {
+  window.clearInterval(job.timer)
+  job.stream?.getTracks().forEach(track => track.stop())
+}
+
+export default function App({ siteNavigation = false }: { siteNavigation?: boolean }) {
   const reducedMotion = usePrefersReducedMotion()
+  const [clip, setClip] = useState<UserClip | null>(null)
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(SAMPLE_DURATION)
-  const [awaitingGesture, setAwaitingGesture] = useState(false)
-  const [source, setSource] = useState<SourceKind>('sample')
-  const [userClip, setUserClip] = useState<UserClip | null>(null)
+  const [choosing, setChoosing] = useState(false)
   const [turns, setTurns] = useState<Turn[]>([])
-  const [clipTurns, setClipTurns] = useState<Turn[]>([])
+  const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
+  const [reading, setReading] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
-  const [recording, setRecording] = useState(false)
+  const [mic, setMic] = useState<MicState>('idle')
   const [recordElapsed, setRecordElapsed] = useState(0)
-  const [selectedId, setSelectedId] = useState<string | null>('u1')
+  const { result, retry } = useRecordingMeasurement(clip)
 
-  const awaitingRef = useRef(false)
-  const sourceRef = useRef<SourceKind>('sample')
-  const userUrlRef = useRef<string | null>(null)
-  const fileRef = useRef<HTMLInputElement>(null)
-  const recorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<Blob[]>([])
-  const recTimerRef = useRef<number | null>(null)
-  const recStartedAtRef = useRef(0)
-  const streamRef = useRef<MediaStream | null>(null)
+  const fileInput = useRef<HTMLInputElement>(null)
+  const generation = useRef(0)
+  const liveUrl = useRef<string | null>(null)
+  const capture = useRef<Capture | null>(null)
+  const askJob = useRef<AbortController | null>(null)
+  const lastAnswer = useRef<string | undefined>(undefined)
+  const queuedQuestion = useRef<{ text: string; pcm: Blob } | null>(null)
+  const cueEnd = useRef<number | null>(null)
   const dragDepth = useRef(0)
-  const askId = useRef(0)
+  const scrollArea = useRef<HTMLElement>(null)
+  const following = useRef(true)
+  const inEntry = !clip || choosing
+  const canAsk = Boolean(clip && result.key && result.phase !== 'measuring' && result.phase !== 'measurement-error')
 
-  sourceRef.current = source
-  awaitingRef.current = awaitingGesture
-
-  const syncDuration = useCallback(() => {
-    const d = audioSession.element.duration
-    if (Number.isFinite(d) && d > 0) setDuration(d)
-    else if (sourceRef.current === 'sample') setDuration(SAMPLE_DURATION)
+  const discardCapture = useCallback(() => {
+    const job = capture.current
+    if (!job) return
+    capture.current = null
+    if (job.recorder && job.recorder.state !== 'inactive') job.recorder.stop()
+    releaseMic(job)
   }, [])
 
   useEffect(() => {
     const el = audioSession.element
     document.body.appendChild(el)
-
-    const onTime = () => setCurrentTime(el.currentTime)
-    const onDur = () => syncDuration()
+    function syncTime() {
+      if (cueEnd.current !== null && el.currentTime >= cueEnd.current) {
+        const end = cueEnd.current
+        cueEnd.current = null
+        el.pause()
+        el.currentTime = end
+      }
+      setCurrentTime(Number.isFinite(el.currentTime) ? el.currentTime : 0)
+    }
     const onPlay = () => setPlaying(true)
     const onPause = () => setPlaying(false)
-    const onEnd = () => {
-      setPlaying(false)
-      setCurrentTime(el.duration || el.currentTime)
-    }
-
-    el.addEventListener('timeupdate', onTime)
-    el.addEventListener('durationchange', onDur)
-    el.addEventListener('loadedmetadata', onDur)
+    el.addEventListener('timeupdate', syncTime)
     el.addEventListener('play', onPlay)
     el.addEventListener('pause', onPause)
-    el.addEventListener('ended', onEnd)
-
-    setPlaying(!el.paused)
-    setCurrentTime(el.currentTime || 0)
-    syncDuration()
-
-    let cancelled = false
-    ;(async () => {
-      try {
-        await audioSession.ensureGraph()
-        if (el.paused) await audioSession.play()
-        if (!cancelled) {
-          setAwaitingGesture(false)
-          awaitingRef.current = false
-        }
-      } catch {
-        if (!cancelled) {
-          setAwaitingGesture(true)
-          awaitingRef.current = true
-        }
-      }
-    })()
-
+    el.addEventListener('ended', onPause)
     return () => {
-      cancelled = true
-      el.removeEventListener('timeupdate', onTime)
-      el.removeEventListener('durationchange', onDur)
-      el.removeEventListener('loadedmetadata', onDur)
+      generation.current++
+      askJob.current?.abort()
+      discardCapture()
+      el.removeEventListener('timeupdate', syncTime)
       el.removeEventListener('play', onPlay)
       el.removeEventListener('pause', onPause)
-      el.removeEventListener('ended', onEnd)
+      el.removeEventListener('ended', onPause)
+      el.pause()
+      el.remove()
+      if (liveUrl.current) URL.revokeObjectURL(liveUrl.current)
+      liveUrl.current = null
     }
-  }, [syncDuration])
-
-  const play = useCallback(async () => {
-    try {
-      await audioSession.ensureGraph()
-      await audioSession.play()
-      setAwaitingGesture(false)
-      awaitingRef.current = false
-      setNotice(null)
-    } catch {
-      setAwaitingGesture(true)
-      awaitingRef.current = true
-    }
-  }, [])
-
-  const pause = useCallback(() => {
-    audioSession.pause()
-  }, [])
-
-  const toggle = useCallback(() => {
-    if (audioSession.element.paused) void play()
-    else pause()
-  }, [play, pause])
-
-  const seek = useCallback((time: number) => {
-    audioSession.seek(time)
-    setCurrentTime(time)
-  }, [])
-
-  const seekAndPlay = useCallback(
-    (time: number) => {
-      audioSession.seek(time)
-      setCurrentTime(time)
-      void play()
-    },
-    [play],
-  )
-
-  const unlockIfNeeded = useCallback(() => {
-    if (awaitingRef.current) void play()
-  }, [play])
-
-  const selectUtterance = useCallback(
-    (id: string, start: number) => {
-      setSelectedId(id)
-      if (awaitingRef.current) {
-        audioSession.seek(start)
-        setCurrentTime(start)
-        void play()
-        return
-      }
-      seek(start)
-    },
-    [play, seek],
-  )
+  }, [discardCapture])
 
   useEffect(() => {
-    if (source !== 'sample') return
-    const hit = utteranceAt(currentTime)
-    if (hit) setSelectedId(hit.id)
-  }, [currentTime, source])
+    const area = scrollArea.current
+    if (inEntry || !area || !turns.length || !following.current) return
+    area.scrollTop = area.scrollHeight
+  }, [turns, inEntry])
 
-  function revokeUserUrl() {
-    if (userUrlRef.current) {
-      clearSpectrogramCache(userUrlRef.current)
-      URL.revokeObjectURL(userUrlRef.current)
-      userUrlRef.current = null
+  useEffect(() => {
+    if (inEntry || !scrollArea.current) return
+    scrollArea.current.focus({ preventScroll: true })
+  }, [clip, inEntry])
+
+  useEffect(() => {
+    const viewport = window.visualViewport
+    const workspace = scrollArea.current?.parentElement
+    if (inEntry || !viewport || !workspace) return
+    // Some mobile keyboards resize only the visual viewport. Leave pinch zoom to the browser.
+    function fitViewport() {
+      if (viewport?.scale === 1) workspace?.style.setProperty('--workspace-height', viewport.height + 'px')
     }
+    fitViewport()
+    viewport.addEventListener('resize', fitViewport)
+    return () => {
+      viewport.removeEventListener('resize', fitViewport)
+      workspace.style.removeProperty('--workspace-height')
+    }
+  }, [inEntry])
+
+  useEffect(() => {
+    if (!siteNavigation) return
+    function leaveLab() {
+      if (!/^#(metrics|api)(?:\/|$)/.test(location.hash)) return
+      discardCapture()
+      setMic('idle')
+      audioSession.pause()
+    }
+    window.addEventListener('hashchange', leaveLab)
+    return () => window.removeEventListener('hashchange', leaveLab)
+  }, [siteNavigation, discardCapture])
+
+  function play() {
+    void audioSession.play().catch(() => setNotice('暂时无法播放，请再点一次播放。'))
   }
 
-  const loadUserClip = useCallback(
-    async (file: Blob, name: string, kind: 'upload' | 'record') => {
-      if (file.size > MAX_BYTES) {
-        setNotice('文件不能超过 30 MB。')
-        return
-      }
-      const url = URL.createObjectURL(file)
-      const dur = await readDuration(url)
-      if (Number.isFinite(dur) && dur > MAX_SECONDS) {
-        URL.revokeObjectURL(url)
-        setNotice('音频请控制在 3 分钟以内。')
-        return
-      }
-      revokeUserUrl()
-      userUrlRef.current = url
-      audioSession.setSrc(url)
-      setUserClip({ url, name, duration: Number.isFinite(dur) && dur > 0 ? dur : 0, kind })
-      setSource('user')
-      setDuration(Number.isFinite(dur) && dur > 0 ? dur : 0)
-      setCurrentTime(0)
-      setPlaying(false)
-      setAwaitingGesture(false)
-      awaitingRef.current = false
-      setNotice(null)
-      setClipTurns([])
-      setSelectedId(null)
-    },
-    [],
-  )
+  function seek(time: number) {
+    cueEnd.current = null
+    audioSession.seek(time)
+    setCurrentTime(time)
+  }
 
-  const restoreSample = useCallback(() => {
-    audioSession.setSrc(SAMPLE_AUDIO_SRC)
-    setSource('sample')
-    setDuration(SAMPLE_DURATION)
+  function listen(start: number, end: number) {
+    seek(start)
+    cueEnd.current = end
+    play()
+  }
+
+  const switchClip = useCallback((next: UserClip) => {
+    askJob.current?.abort()
+    askJob.current = null
+    lastAnswer.current = undefined
+    cueEnd.current = null
+    const oldUrl = liveUrl.current
+    liveUrl.current = next.url
+    audioSession.setSrc(next.url)
+    if (oldUrl) URL.revokeObjectURL(oldUrl)
+    setClip(next)
+    setTurns([])
+    queuedQuestion.current = null
+    following.current = true
+    if (scrollArea.current) scrollArea.current.scrollTop = 0
+    setChoosing(false)
     setCurrentTime(0)
     setPlaying(false)
+    setBusy(false)
     setNotice(null)
-    setClipTurns([])
-    setSelectedId('u1')
   }, [])
 
-  const onFileChosen = useCallback(
-    (file: File | undefined) => {
-      if (!file) return
-      if (!isAudioFile(file)) {
-        setNotice('请上传 wav、mp3、m4a、webm 或 ogg 音频。')
+  const loadClip = useCallback(async (input: Blob | Promise<Blob>, name: string, source: ClipSource) => {
+    const id = ++generation.current
+    setNotice(null)
+    setReading(true)
+    try {
+      const file = await input
+      if (id !== generation.current) return
+      if (!file.size || file.size > MAX_BYTES) {
+        setNotice(file.size ? '文件不能超过 30 MB。' : '音频是空的，请再试一次。')
         return
       }
-      void loadUserClip(file, file.name, 'upload')
-    },
-    [loadUserClip],
-  )
+      const decoded = await decodeMono(file)
+      if (id !== generation.current) return
+      const maxSamples = MAX_SECONDS * SAMPLE_RATE
+      if (source !== 'recording' && decoded.length > maxSamples) {
+        setNotice('请选择 3 分钟以内的音频。')
+        return
+      }
+      const samples = decoded.subarray(0, maxSamples)
+      if (samples.length < 0.03 * SAMPLE_RATE) {
+        setNotice('音频太短，请再录一段或选择其他文件。')
+        return
+      }
+      const pcm = encodePcm(samples)
+      const url = URL.createObjectURL(source === 'recording' ? playbackWav(pcm) : file)
+      switchClip({ url, name, samples, pcm, duration: samples.length / SAMPLE_RATE, source })
+    } catch {
+      if (id === generation.current) setNotice('这段音频无法读取，请重试或选择其他文件。')
+    } finally {
+      if (id === generation.current) setReading(false)
+    }
+  }, [switchClip])
+
+  const onFileChosen = useCallback((file?: File) => {
+    if (!file) return
+    if (!file.type.startsWith('audio/') && !/\.(mp3|wav|m4a|webm|ogg|oga)$/i.test(file.name)) {
+      generation.current++
+      setReading(false)
+      setNotice('请上传 wav、mp3、m4a、webm 或 ogg 音频。')
+      return
+    }
+    discardCapture()
+    setMic('idle')
+    void loadClip(file, file.name, 'upload')
+  }, [discardCapture, loadClip])
+
+  function cancelRecording() {
+    discardCapture()
+    setMic('idle')
+    setNotice(null)
+  }
+
+  function finishRecording() {
+    const recorder = capture.current?.recorder
+    if (recorder?.state === 'recording') recorder.stop()
+  }
+
+  function chooseAudio() {
+    if (inEntry) return
+    generation.current++
+    queuedQuestion.current = null
+    cancelRecording()
+    audioSession.pause()
+    setReading(false)
+    setChoosing(true)
+  }
+
+  function cancelEntry() {
+    generation.current++
+    queuedQuestion.current = null
+    cancelRecording()
+    setReading(false)
+    setChoosing(false)
+  }
 
   useEffect(() => {
+    const hasFiles = (e: DragEvent) => !document.getElementById('root')?.hidden && Array.from(e.dataTransfer?.types ?? []).includes('Files')
     const onEnter = (e: DragEvent) => {
-      if (!hasFiles(e)) return
-      e.preventDefault()
-      dragDepth.current += 1
-      setDragging(true)
+      if (hasFiles(e)) { e.preventDefault(); dragDepth.current++; setDragging(true) }
     }
     const onOver = (e: DragEvent) => {
-      if (!hasFiles(e)) return
-      e.preventDefault()
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+      if (hasFiles(e)) { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy' }
     }
     const onLeave = (e: DragEvent) => {
-      if (!hasFiles(e) && dragDepth.current === 0) return
-      e.preventDefault()
-      dragDepth.current = Math.max(0, dragDepth.current - 1)
-      if (dragDepth.current === 0) setDragging(false)
+      if (dragDepth.current) { e.preventDefault(); if (--dragDepth.current === 0) setDragging(false) }
     }
     const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return
       e.preventDefault()
       dragDepth.current = 0
       setDragging(false)
-      const file = e.dataTransfer?.files?.[0]
-      onFileChosen(file)
+      onFileChosen(e.dataTransfer?.files[0])
     }
     window.addEventListener('dragenter', onEnter)
     window.addEventListener('dragover', onOver)
@@ -280,305 +288,185 @@ export default function App() {
     }
   }, [onFileChosen])
 
-  useEffect(() => {
-    return () => {
-      revokeUserUrl()
-      stopRecInternal()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const startRecording = useCallback(async () => {
-    setNotice(null)
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setNotice('当前浏览器不支持录音。')
+  async function startRecording() {
+    if (capture.current) return
+    audioSession.pause()
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setNotice('这个浏览器无法录音。可在系统浏览器打开本页，或上传音频。')
       return
     }
+    const job: Capture = {}
+    capture.current = job
+    generation.current++
+    setReading(false)
+    setMic('requesting')
+    setNotice(null)
     try {
-      pause()
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      streamRef.current = stream
-      const mime = pickMime()
-      const rec = mime
-        ? new MediaRecorder(stream, { mimeType: mime })
-        : new MediaRecorder(stream)
-      chunksRef.current = []
-      rec.ondataavailable = (e) => {
-        if (e.data.size) chunksRef.current.push(e.data)
-      }
+      job.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (capture.current !== job) { releaseMic(job); return }
+      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'].find(type => MediaRecorder.isTypeSupported(type))
+      const rec = new MediaRecorder(job.stream, mimeType ? { mimeType } : undefined)
+      job.recorder = rec
+      const chunks: Blob[] = []
+      rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data) }
       rec.onstop = () => {
-        const type = rec.mimeType || 'audio/webm'
-        const blob = new Blob(chunksRef.current, { type })
-        const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm'
-        if (blob.size > 0) {
-          void loadUserClip(blob, `录音.${ext}`, 'record')
-        }
-        stream.getTracks().forEach((t) => t.stop())
-        streamRef.current = null
+        releaseMic(job)
+        if (capture.current !== job) return
+        capture.current = null
+        setMic('idle')
+        void loadClip(new Blob(chunks, { type: rec.mimeType }), '我的录音', 'recording')
       }
-      recorderRef.current = rec
+      rec.onerror = () => {
+        if (capture.current !== job) return
+        discardCapture()
+        setMic('idle')
+        setNotice('录音已中断，请重新录音。')
+      }
+      audioSession.pause()
       rec.start()
-      recStartedAtRef.current = performance.now()
+      const start = performance.now()
       setRecordElapsed(0)
-      setRecording(true)
-      recTimerRef.current = window.setInterval(() => {
-        const elapsed = (performance.now() - recStartedAtRef.current) / 1000
+      setMic('recording')
+      setNotice(null)
+      job.timer = window.setInterval(() => {
+        const elapsed = (performance.now() - start) / 1000
         setRecordElapsed(elapsed)
-        if (elapsed >= MAX_SECONDS) {
-          stopRecInternal()
-          setRecording(false)
-        }
+        if (elapsed >= MAX_SECONDS && rec.state === 'recording') rec.stop()
       }, 200)
     } catch {
-      setNotice('无法使用麦克风，请检查权限。')
+      releaseMic(job)
+      if (capture.current !== job) return
+      capture.current = null
+      setMic('idle')
+      setNotice('无法打开麦克风，请允许浏览器使用麦克风，或上传音频。')
     }
-  }, [loadUserClip, pause])
-
-  const stopRecording = useCallback(() => {
-    stopRecInternal()
-    setRecording(false)
-  }, [])
-
-  function stopRecInternal() {
-    if (recTimerRef.current) {
-      clearInterval(recTimerRef.current)
-      recTimerRef.current = null
-    }
-    const rec = recorderRef.current
-    if (rec && rec.state !== 'inactive') rec.stop()
-    recorderRef.current = null
-    streamRef.current?.getTracks().forEach((t) => t.stop())
-    streamRef.current = null
   }
 
-  const onAsk = useCallback(
-    async (question: string) => {
-      const onSample = sourceRef.current === 'sample'
-      const qid = `q-${++askId.current}`
-      const aid = `a-${askId.current}`
-      const setActive = onSample ? setTurns : setClipTurns
-      const sendGap = reducedMotion ? 0 : 380
-      const listenMs = reducedMotion ? 160 : 1400
-
-      setBusy(true)
-      setActive((prev) => [...prev, { id: qid, role: 'user', text: question }])
-      await wait(sendGap)
-
-      setActive((prev) => [
-        ...prev,
-        { id: aid, role: 'assistant', thinking: true, paragraphs: [], cues: [] },
-      ])
-      await wait(listenMs)
-
-      if (!onSample) {
-        setActive((prev) =>
-          prev.map((t) =>
-            t.id === aid && t.role === 'assistant'
-              ? {
-                  id: aid,
-                  role: 'assistant',
-                  paragraphs: [
-                    '这段原型的完整描述和根据指标给出的回答，是为官方示例音频准备的。你可以继续播放自己的音频，或切回示例音频。',
-                  ],
-                  cues: [],
-                }
-              : t,
-          ),
-        )
-        setBusy(false)
-        return
+  const onAsk = useCallback(async (question: string, retryAnswerId?: string) => {
+    if (!clip || inEntry || askJob.current || capture.current || !canAsk || reading) return
+    queuedQuestion.current = null
+    setNotice(null)
+    const job = new AbortController()
+    askJob.current = job
+    following.current = true
+    setBusy(true)
+    const id = crypto.randomUUID()
+    const pending: Turn = { id: retryAnswerId ?? id + '-a', role: 'assistant', thinking: true, paragraphs: [], cues: [] }
+    setTurns(prev => retryAnswerId
+      ? prev.map(turn => turn.id === retryAnswerId ? pending : turn)
+      : [...prev, { id, role: 'user', text: question }, pending])
+    let reply: Turn
+    try {
+      const answer = await askRecording(question, result, clip.duration, lastAnswer.current, job.signal)
+      if (job.signal.aborted) return
+      lastAnswer.current = answer.turn
+      reply = { id: pending.id, role: 'assistant', paragraphs: answer.paragraphs, cues: answer.cues }
+    } catch (error) {
+      if (job.signal.aborted) return
+      let text = error instanceof Error && !(error instanceof TypeError) ? error.message : '暂时连不上问答服务，请重试。'
+      if (error instanceof MeasurementExpiredError) {
+        lastAnswer.current = undefined
+        retry(true)
+        text = '正在重新测量录音，完成后可以重试这条提问。'
       }
-
-      const answer = matchAnswer(question)
-      const usedMetrics = answer
-        ? METRICS.filter((m) => answer.usedMetricIds.includes(m.id))
-        : []
-      setActive((prev) =>
-        prev.map((t) =>
-          t.id === aid && t.role === 'assistant'
-            ? {
-                id: aid,
-                role: 'assistant',
-                paragraphs: answer ? answer.paragraphs : [OFFTOPIC],
-                cues: answer ? answer.cues : [],
-                usedMetrics,
-              }
-            : t,
-        ),
-      )
-      setBusy(false)
-    },
-    [reducedMotion],
-  )
+      reply = { id: pending.id, role: 'assistant', paragraphs: [text], cues: [], retryQuestion: question }
+    } finally {
+      if (askJob.current === job) { askJob.current = null; setBusy(false) }
+    }
+    setTurns(prev => prev.map(turn => turn.id === pending.id ? reply : turn))
+  }, [clip, inEntry, canAsk, reading, result, retry])
 
   useEffect(() => {
-    const thread = document.querySelector('.thread')
-    if (!thread) return
-    const last = thread.lastElementChild
-    last?.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'end' })
-  }, [turns, clipTurns, source, reducedMotion])
+    const queued = queuedQuestion.current
+    if (!queued || queued.pcm !== clip?.pcm || inEntry || !canAsk || reading || busy || mic !== 'idle') return
+    queuedQuestion.current = null
+    setDraft('')
+    void onAsk(queued.text)
+  }, [clip, inEntry, canAsk, reading, busy, mic, onAsk])
 
-  const isSample = source === 'sample'
-  const label = isSample
-    ? SAMPLE_SUBTITLE
-    : `${userClip?.name ?? '音频'} · ${formatDurationLabel(userClip?.duration ?? duration)}`
-  const activeTurns = isSample ? turns : clipTurns
-  const audioSrc = isSample ? SAMPLE_AUDIO_SRC : (userClip?.url ?? SAMPLE_AUDIO_SRC)
+  function submitDraft(question: string) {
+    if (!clip || choosing || askJob.current || capture.current || reading) return
+    if (!canAsk) {
+      queuedQuestion.current = { text: question, pcm: clip.pcm }
+      setNotice('测量完成后会发送这个问题。')
+      return
+    }
+    setDraft('')
+    void onAsk(question)
+  }
+
+  function updateDraft(value: string) {
+    if (queuedQuestion.current) {
+      queuedQuestion.current = null
+      setNotice(null)
+    }
+    setDraft(value)
+  }
+
+  const openFile = () => fileInput.current?.click()
+  const measuredFacts = result.phase === 'description-unavailable'
+    ? result.metrics.filter(metric => ['duration_s', 'speech_detected_s', 'pause'].includes(metric.id))
+      .map(metric => metric.label + ' ' + metric.value).join('，')
+    : ''
+  const headerAction = !clip ? undefined : inEntry
+    ? { label: '返回对话', onClick: cancelEntry }
+    : { label: '更换音频', onClick: chooseAudio }
+  const composer = (
+    <Composer value={draft} onChange={updateDraft} onSubmit={submitDraft} needsAudio={inEntry}
+      disabled={!inEntry && (busy || result.phase === 'measurement-error')}
+      mic={mic} elapsed={recordElapsed} reading={reading} notice={notice}
+      onUpload={openFile} onRecord={() => void startRecording()} onFinish={finishRecording} onCancel={cancelRecording} />
+  )
 
   return (
-    <div className="app" id="top">
-      <Header />
-      <main className="main">
-        <section className="hero shell-wide" onPointerDown={unlockIfNeeded}>
-          <div className="hero-copy shell">
-            <h1>LLM 理解了文字，但声音呢？</h1>
-            <p className="hero-sub">
-              模型不只记下说了什么，也会听它是怎么说的。你可以直接问这段声音。
-            </p>
-          </div>
-          <Spectrogram
-            src={audioSrc}
-            currentTime={currentTime}
-            duration={isSample ? duration || SAMPLE_DURATION : duration}
-            playing={playing}
-            showLabels={isSample}
-            reducedMotion={reducedMotion}
-            selectedId={isSample ? selectedId : null}
-            onSelect={selectUtterance}
-            onSeek={seek}
-            onSeekActivate={unlockIfNeeded}
-          />
-          <div className="shell">
-            <Player
-              playing={playing}
-              currentTime={currentTime}
-              duration={isSample ? duration || SAMPLE_DURATION : duration}
-              label={label}
-              onToggle={toggle}
-              onSeek={seek}
-              onScrubActivate={unlockIfNeeded}
-            />
-            {!isSample && (
-              <button type="button" className="back-link" onClick={restoreSample}>
-                切回示例音频
-              </button>
-            )}
-          </div>
-        </section>
+    <div className={inEntry ? 'app entry-page' : 'app workspace'} id="top">
+      <Header siteNavigation={siteNavigation} onHome={chooseAudio} action={headerAction} />
+      {!clip || choosing ? (
+        <AudioEntry onSample={mic === 'idle' && !reading ? () => void loadClip(sampleFile(), SAMPLE_TITLE, 'sample') : undefined}>
+          {composer}
+        </AudioEntry>
+      ) : (
+        <>
+          <main className="workspace-scroll" ref={scrollArea} tabIndex={-1} aria-label="音频与对话"
+            onScroll={event => {
+              const area = event.currentTarget
+              following.current = area.scrollHeight - area.scrollTop - area.clientHeight < 80
+            }}>
+            <div className="workspace-content shell">
+              <section className="audio-sheet" aria-label="音频与测量结果">
+                <Player label={clip.name} playing={playing} currentTime={currentTime} duration={clip.duration} onSeek={seek}
+                  onToggle={() => { if (playing) audioSession.pause(); else { cueEnd.current = null; play() } }} />
+                <Spectrogram key={clip.url} src={clip.url} samples={clip.samples} currentTime={currentTime}
+                  duration={clip.duration} playing={playing} reducedMotion={reducedMotion} onSeek={seek} />
+                <Metrics key={'metrics-' + clip.url} metrics={result.metrics} marks={result.marks} onListen={listen} />
+                {clip.source === 'sample' && <p className="sample-credit">
+                  Psych2Go · CC BY 3.0 <a href={SAMPLE_CREDIT_URL} target="_blank" rel="noreferrer">音频来源</a>
+                </p>}
+              </section>
 
-        {isSample && (
-          <div className="shell-wide">
-            <Metrics />
-          </div>
-        )}
-
-        <section className="section shell">
-          <h2 className="section-label">音频描述</h2>
-          {isSample ? (
-            <p className="description">{DESCRIPTION}</p>
-          ) : (
-            <div className="user-note">
-              <p>
-                这段原型的完整描述和根据指标给出的回答，是为官方示例音频准备的。你可以继续播放自己的音频，或切回示例音频。
-              </p>
+              <Thread turns={turns} onSeekCue={listen} onRetry={onAsk} introduction={result.description
+                ? <p className="description">{result.description}</p>
+                : <div className="measurement-status">
+                    {measuredFacts && <p>本次测得{measuredFacts}。</p>}
+                    {result.message && <p>{result.message}</p>}
+                    {(result.phase === 'measurement-error' || result.phase === 'description-unavailable') && (
+                      <button type="button" className="text-button" onClick={() => {
+                        if (result.phase === 'measurement-error') lastAnswer.current = undefined
+                        retry()
+                      }}>{result.phase === 'description-unavailable' ? '重新生成描述' : '重新测量'}</button>
+                    )}
+                  </div>} />
+              {canAsk && mic === 'idle' && !turns.length && <div className="chips" role="group" aria-label="可以这样问">
+                {questions[result.questionSet ?? 'conversation'].map(question => <button type="button" className="chip" key={question} onClick={() => void onAsk(question)}>{question}</button>)}
+              </div>}
             </div>
-          )}
-          {notice && <p className="notice">{notice}</p>}
-        </section>
-
-        <div className="shell">
-          <Thread turns={activeTurns} onSeekCue={seekAndPlay} reducedMotion={reducedMotion} />
-        </div>
-
-        <footer className="site-foot shell">
-          <p>
-            示例音频摘自 Psych2Go 采访，讲述者 Claire Webster，采访者 Monica Taing，McGill
-            Dementia Education Program，CC BY 3.0。
-          </p>
-          <p>不要从声音诊断疾病。出声的是照护者，不是患者。</p>
-        </footer>
-      </main>
-
-      <Composer
-        disabled={busy}
-        showChips={isSample && !busy}
-        recording={recording}
-        recordElapsed={recordElapsed}
-        onSubmit={onAsk}
-        onUpload={() => fileRef.current?.click()}
-        onRecordStart={() => void startRecording()}
-        onRecordStop={stopRecording}
-      />
-
-      <input
-        ref={fileRef}
-        className="sr-only"
-        type="file"
-        accept="audio/*,.mp3,.wav,.m4a,.webm,.ogg"
-        onChange={(e) => {
-          onFileChosen(e.target.files?.[0])
-          e.target.value = ''
-        }}
-      />
-
-      {dragging && (
-        <div className="drop-overlay" role="status">
-          <span>松开以使用这段音频</span>
-        </div>
+          </main>
+          <footer className="dock"><div className="shell">{composer}</div></footer>
+        </>
       )}
+      <input ref={fileInput} hidden type="file" accept="audio/*,.mp3,.wav,.m4a,.webm,.ogg,.oga" aria-label="上传音频文件"
+        onChange={event => { onFileChosen(event.target.files?.[0]); event.target.value = '' }} />
+      {dragging && <div className="drop-overlay" role="status"><span>松开以测量这段音频</span></div>}
     </div>
   )
-}
-
-function wait(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function hasFiles(e: DragEvent): boolean {
-  const types = e.dataTransfer?.types
-  if (!types) return false
-  return Array.from(types).includes('Files')
-}
-
-function isAudioFile(file: File): boolean {
-  if (file.type.startsWith('audio/')) return true
-  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
-  return ACCEPT_EXT.has(ext)
-}
-
-function pickMime(): string | undefined {
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-    'audio/ogg;codecs=opus',
-  ]
-  if (typeof MediaRecorder === 'undefined') return undefined
-  return candidates.find((c) => MediaRecorder.isTypeSupported(c))
-}
-
-function readDuration(url: string): Promise<number> {
-  return new Promise((resolve) => {
-    const el = document.createElement('audio')
-    el.preload = 'metadata'
-    const done = (value: number) => {
-      el.removeAttribute('src')
-      el.load()
-      resolve(value)
-    }
-    el.onloadedmetadata = () => {
-      const d = el.duration
-      done(Number.isFinite(d) && d > 0 ? d : 0)
-    }
-    el.onerror = () => done(0)
-    el.src = url
-  })
-}
-
-function formatDurationLabel(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '已载入'
-  if (seconds < 60) return `${seconds.toFixed(1).replace(/\.0$/, '')} 秒`
-  const m = Math.floor(seconds / 60)
-  const s = Math.round(seconds % 60)
-  return `${m} 分 ${s} 秒`
 }

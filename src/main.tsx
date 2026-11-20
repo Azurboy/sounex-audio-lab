@@ -3,8 +3,9 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import './index.css'
 
-createRoot(document.getElementById('root')!).render(
+const root = document.getElementById('root')!
+createRoot(root).render(
   <StrictMode>
-    <App />
+    <App siteNavigation={root.hasAttribute('data-site-navigation')} />
   </StrictMode>,
 )

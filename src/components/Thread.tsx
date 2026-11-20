@@ -1,81 +1,44 @@
-import type { Answer, Metric } from '../data/sample'
-import { formatTime } from '../lib/time'
+import brandMark from '/brand/mark.svg?url'
+import type { ReactNode } from 'react'
+import type { AudioCue } from '../lib/measurement'
+import { AudioCues } from './AudioCues'
 
 export type Turn =
   | { id: string; role: 'user'; text: string }
-  | {
-      id: string
-      role: 'assistant'
-      thinking?: boolean
-      paragraphs: string[]
-      cues: Answer['cues']
-      usedMetrics?: Metric[]
-    }
+  | { id: string; role: 'assistant'; thinking?: boolean; retryQuestion?: string; paragraphs: string[]; cues: AudioCue[] }
 
 type Props = {
+  introduction: ReactNode
   turns: Turn[]
-  onSeekCue: (start: number) => void
-  reducedMotion?: boolean
+  onSeekCue: (start: number, end: number) => void
+  onRetry: (question: string, answerId: string) => void
 }
 
-export function Thread({ turns, onSeekCue, reducedMotion }: Props) {
-  if (turns.length === 0) return null
-
+function AssistantMessage({ children }: { children: ReactNode }) {
   return (
-    <div className="thread" aria-live="polite">
-      {turns.map((turn) =>
-        turn.role === 'user' ? (
-          <div
-            className={`turn-user${reducedMotion ? '' : ' is-entering'}`}
-            key={turn.id}
-          >
-            <span className="who">问</span>
-            {turn.text}
-          </div>
-        ) : (
-          <div className="turn-assistant" key={turn.id}>
-            {turn.thinking ? (
-              <div className="thinking" aria-label="正在听这段声音">
-                <span className="thinking-label">正在听</span>
-                <i /><i /><i />
-              </div>
-            ) : (
-              <div className={reducedMotion ? undefined : 'reply-body'}>
-                {turn.paragraphs.map((p) => (
-                  <p key={p}>{p}</p>
-                ))}
-                {turn.cues.length > 0 && (
-                  <div className="cues">
-                    {turn.cues.map((cue) => (
-                      <button
-                        key={`${cue.start}-${cue.label}`}
-                        type="button"
-                        className="cue"
-                        onClick={() => onSeekCue(cue.start)}
-                      >
-                        <time>{formatTime(cue.start)}</time>
-                        <span>{cue.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {turn.usedMetrics && turn.usedMetrics.length > 0 && (
-                  <div className="used-metrics">
-                    <span className="used-metrics-label">用到的指标</span>
-                    {turn.usedMetrics.map((m) => (
-                      <span className="used-metric" key={m.id}>
-                        <span className="used-metric-k">{m.label}</span>
-                        <span className="used-metric-v">{m.value}</span>
-                      </span>
-                    ))}
-                  </div>
-                )}
-                <p className="disclaimer">AI 生成，仅供参考。</p>
-              </div>
-            )}
-          </div>
-        ),
-      )}
+    <div className="turn-assistant" role="group" aria-label="Sounex 回复">
+      <img className="assistant-mark" src={brandMark} width="26" height="26" alt="" />
+      <div className="reply-body">{children}</div>
+    </div>
+  )
+}
+
+export function Thread({ introduction, turns, onSeekCue, onRetry }: Props) {
+  return (
+    <div className="thread" role="log" aria-label="音频对话" aria-live="polite" aria-relevant="additions text">
+      <AssistantMessage>{introduction}</AssistantMessage>
+      {turns.map((turn, i) => turn.role === 'user'
+        ? <div className="turn-user" role="group" aria-label="你的提问" key={turn.id}>{turn.text}</div>
+        : <AssistantMessage key={turn.id}>
+            {turn.thinking
+              ? <p className="thinking">正在听这段声音…</p>
+              : <>
+                  {turn.paragraphs.map((paragraph, i) => <p key={i}>{paragraph}</p>)}
+                  <AudioCues cues={turn.cues} onListen={onSeekCue} />
+                  {turn.retryQuestion && i === turns.length - 1 &&
+                    <button type="button" className="text-button" onClick={() => onRetry(turn.retryQuestion!, turn.id)}>重试回答</button>}
+                </>}
+          </AssistantMessage>)}
     </div>
   )
 }
