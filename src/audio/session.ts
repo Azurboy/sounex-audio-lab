@@ -1,7 +1,3 @@
-import { SAMPLE_AUDIO_SRC } from '../data/sample'
-
-export type Listener = () => void
-
 function createElement(): HTMLAudioElement {
   const el = document.createElement('audio')
   el.preload = 'auto'
@@ -9,7 +5,6 @@ function createElement(): HTMLAudioElement {
   el.controls = false
   el.crossOrigin = 'anonymous'
   el.setAttribute('hidden', '')
-  el.src = SAMPLE_AUDIO_SRC
   return el
 }
 

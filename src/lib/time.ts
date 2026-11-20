@@ -12,3 +12,8 @@ export function formatClock(seconds: number): string {
   const s = Math.floor(seconds % 60)
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
+
+export function formatMarkTime(seconds: number): string {
+  const tenths = Math.max(0, Math.round(seconds * 10))
+  return formatTime(tenths / 10) + (tenths % 10 ? '.' + tenths % 10 : '')
+}

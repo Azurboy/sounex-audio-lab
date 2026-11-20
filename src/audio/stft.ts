@@ -1,4 +1,4 @@
-/** Offline STFT for a real spectrogram exhibit. No live model, no extra deps. */
+import { decodeMono, SAMPLE_RATE } from './pcm'
 
 export const F_MIN = 80
 export const F_MAX = 8000
@@ -21,49 +21,37 @@ export type SpectrogramData = {
 const FFT_SIZE = 1024
 const HOP = 256
 const LOG_BINS = 256
-const TARGET_RATE = 16000
+let bundled: { src: string; result: Promise<SpectrogramData> } | undefined
 
-const sampleCache = new Map<string, SpectrogramData>()
-
-export function clearSpectrogramCache(src?: string): void {
-  if (src) sampleCache.delete(src)
-  else sampleCache.clear()
+export function computeSpectrogram(src: string, samples?: Float32Array): Promise<SpectrogramData> {
+  if (samples) return Promise.resolve().then(() => spectrumFromSamples(samples))
+  if (bundled?.src === src) return bundled.result
+  const result = fetch(src)
+    .then(response => {
+      if (!response.ok) throw new Error('无法读取音频。')
+      return response.blob()
+    })
+    .then(decodeMono)
+    .then(spectrumFromSamples)
+    .catch(error => {
+      if (bundled?.src === src) bundled = undefined
+      throw error
+    })
+  bundled = { src, result }
+  return result
 }
 
-export async function computeSpectrogram(src: string): Promise<SpectrogramData> {
-  const hit = sampleCache.get(src)
-  if (hit) return hit
-
-  const res = await fetch(src)
-  if (!res.ok) throw new Error(`无法读取音频（${res.status}）`)
-  const raw = await res.arrayBuffer()
-  const ctx = new AudioContext()
-  let buffer: AudioBuffer
-  try {
-    buffer = await ctx.decodeAudioData(raw.slice(0))
-  } finally {
-    await ctx.close()
-  }
-
-  const data = stftFromBuffer(buffer)
-  // Cache official and blob URLs; revoked blobs are dropped by the caller.
-  sampleCache.set(src, data)
-  return data
-}
-
-export function stftFromBuffer(buffer: AudioBuffer): SpectrogramData {
-  const mono = mixMono(buffer)
-  const sr0 = buffer.sampleRate
-  const samples = sr0 === TARGET_RATE ? mono : resampleLinear(mono, sr0, TARGET_RATE)
-  const sampleRate = sr0 === TARGET_RATE ? sr0 : TARGET_RATE
-  const duration = buffer.duration
+function spectrumFromSamples(samples: Float32Array): SpectrogramData {
+  const sampleRate = SAMPLE_RATE
+  const duration = samples.length / sampleRate
+  const hop = Math.max(HOP, Math.ceil(samples.length / 1600))
 
   const window = hann(FFT_SIZE)
   let windowSum = 0
   for (let i = 0; i < FFT_SIZE; i++) windowSum += window[i]!
   const ampRef = windowSum / 2
 
-  const nFrames = Math.max(1, Math.ceil(samples.length / HOP))
+  const nFrames = Math.max(1, Math.ceil(samples.length / hop))
   const db = new Float32Array(nFrames * LOG_BINS)
   const re = new Float32Array(FFT_SIZE)
   const im = new Float32Array(FFT_SIZE)
@@ -71,7 +59,7 @@ export function stftFromBuffer(buffer: AudioBuffer): SpectrogramData {
   const linearDb = new Float32Array(linearBins)
 
   for (let f = 0; f < nFrames; f++) {
-    const offset = f * HOP
+    const offset = f * hop
     re.fill(0)
     im.fill(0)
     for (let i = 0; i < FFT_SIZE; i++) {
@@ -131,22 +119,14 @@ export function freqToRatio(freq: number, fMin = F_MIN, fMax = F_MAX): number {
   return Math.log(clamped / fMin) / Math.log(fMax / fMin)
 }
 
-const PAPER = [240, 233, 220] as const
-const INK3 = [139, 130, 115] as const
-const INK2 = [98, 92, 80] as const
-const INK = [41, 39, 31] as const
-const ACCENT = [194, 96, 62] as const
-
-/** Map dB to official-token RGB. Quiet→paper/ink3, peaks→ink then accent. */
-export function colorFromDb(db: number, dbMin = DB_MIN, dbMax = DB_MAX): [number, number, number] {
-  let t = (db - dbMin) / (dbMax - dbMin)
-  t = Math.max(0, Math.min(1, t))
-  t = t ** 0.85
-  if (t < 0.18) return lerp3(PAPER, INK3, t / 0.18)
-  if (t < 0.48) return lerp3(INK3, INK2, (t - 0.18) / 0.3)
-  if (t < 0.78) return lerp3(INK2, INK, (t - 0.48) / 0.3)
-  return lerp3(INK, ACCENT, (t - 0.78) / 0.22)
-}
+// Quiet bins blend into the paper. Strong harmonics deepen from ochre to umber.
+const colors = [[249, 245, 235], [245, 234, 211], [232, 204, 161],
+  [209, 159, 111], [176, 108, 74], [122, 72, 54], [67, 44, 37]] as const
+const palette = Array.from({ length: 256 }, (_, i) => {
+  const t = (i / 255) * (colors.length - 1)
+  const j = Math.min(Math.floor(t), colors.length - 2)
+  return lerp3(colors[j], colors[j + 1], t - j)
+})
 
 export function renderSpectrogram(
   ctx: CanvasRenderingContext2D,
@@ -161,7 +141,8 @@ export function renderSpectrogram(
     for (let x = 0; x < width; x++) {
       const timeRatio = (x + 0.5) / width
       const db = sampleDb(data, timeRatio, freqRatio)
-      const [r, g, b] = colorFromDb(db, data.dbMin, data.dbMax)
+      const intensity = (db - data.dbMin) / (data.dbMax - data.dbMin)
+      const [r, g, b] = palette[Math.round(Math.max(0, Math.min(1, intensity)) * 255)]
       const i = (y * width + x) * 4
       px[i] = r
       px[i + 1] = g
@@ -183,36 +164,6 @@ function lerp3(
     Math.round(a[1] + (b[1] - a[1]) * u),
     Math.round(a[2] + (b[2] - a[2]) * u),
   ]
-}
-
-function mixMono(buffer: AudioBuffer): Float32Array {
-  const n = buffer.length
-  const ch = buffer.numberOfChannels
-  if (ch === 1) return buffer.getChannelData(0).slice()
-  const out = new Float32Array(n)
-  const inv = 1 / ch
-  for (let c = 0; c < ch; c++) {
-    const data = buffer.getChannelData(c)
-    for (let i = 0; i < n; i++) out[i]! += data[i]! * inv
-  }
-  return out
-}
-
-function resampleLinear(data: Float32Array, from: number, to: number): Float32Array {
-  if (from === to) return data
-  const n = Math.max(1, Math.round((data.length * to) / from))
-  const out = new Float32Array(n)
-  const ratio = from / to
-  const last = data.length - 1
-  for (let i = 0; i < n; i++) {
-    const x = i * ratio
-    const j = Math.floor(x)
-    const f = x - j
-    const a = data[Math.min(j, last)]!
-    const b = data[Math.min(j + 1, last)]!
-    out[i] = a + (b - a) * f
-  }
-  return out
 }
 
 function hann(n: number): Float32Array {

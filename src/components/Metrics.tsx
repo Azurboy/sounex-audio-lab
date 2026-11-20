@@ -1,20 +1,22 @@
-import { METRICS } from '../data/sample'
+import type { AudioMark, Metric } from '../lib/measurement'
+import { AudioCues } from './AudioCues'
 
-export function Metrics() {
+type Props = { metrics: Metric[]; marks: AudioMark[]; onListen: (start: number, end: number) => void }
+
+export function Metrics({ metrics, marks, onListen }: Props) {
+  if (!metrics.length) return null
   return (
-    <section className="metric-strip" aria-label="测得的声学量">
-      <h2 className="section-label">测得的声学量</h2>
+    <details className="metric-strip">
+      <summary>声音指标<span className="metric-count">{metrics.length} 项</span></summary>
       <dl>
-        {METRICS.map((m) => (
+        {metrics.map(m => (
           <div className="metric-cell" key={m.id}>
             <dt>{m.label}</dt>
-            <dd>
-              {m.value}
-              {m.note ? <span className="note">{m.note}</span> : null}
-            </dd>
+            <dd>{m.value}{m.note && <span className="note">{m.note}</span>}</dd>
           </div>
         ))}
       </dl>
-    </section>
+      <AudioCues cues={marks} onListen={onListen} />
+    </details>
   )
 }
